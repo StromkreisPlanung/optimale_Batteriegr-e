@@ -1,6 +1,5 @@
 streamlit==1.35.0
-pandas==2.3.1
-numpy==2.3.1
+pandas==1.5.3      # verträgt numpy < 2
+numpy==1.24.4
 matplotlib==3.8.4
-pypsa==0.35.1        # diese Version hat CP312‑Wheels
-# highspy==1.6.2.post10   # OPTIONAL – nur wenn du HiGHS nutzen wi
+pypsa==0.35.1
