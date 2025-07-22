@@ -9,7 +9,23 @@ Funktionalität bleibt wie zuvor, jedoch:
   Streamlit Community Cloud mit Standard‐GLPK.
 * `net.optimize()` überlässt die Solver‑Wahl PyPSA; wenn in der Umgebung
   `highspy` oder `cbc` verfügbar ist, wird dieser genutzt, sonst GLPK.
-* Kommentare enthalten minimale **requirements.txt** und **runtime.txt**
+* Kommentare enthalten minimale **requirements.txt
+----------------
+```
+# Fix: Streamlit 1.35 verlangt numpy<2 → deshalb bleiben wir bei älteren Versionen
+streamlit==1.35.0
+pandas==1.5.3      # letzte Pandas‑Version, die noch mit numpy<2 funktioniert
+numpy==1.24.4
+matplotlib==3.8.4
+pypsa==0.35.1
+```
+
+runtime.txt
+-----------
+```
+python-3.12.3
+```
+**
   Beispiele zur reibungslosen Bereitstellung.
 """
 
