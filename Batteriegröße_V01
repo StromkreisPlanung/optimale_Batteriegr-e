@@ -1,0 +1,236 @@
+Streamlit‑App für Batterie‑Sizing
+================================
+Interaktives Frontend zu `battery_sizing.py`
+-------------------------------------------
+
+* Benutzer lädt Last‑, PV‑ und optionale EV‑CSV‑Dateien hoch **oder** gibt Energie‑/Leistungs‑Fenster für Smart‑EV‑Laden an.
+* Grid‑Limit und CapEx‑Parameter als einfache Zahleneingaben.
+* Ergebnis: optimale kW/kWh, SOC‑Plot, Net Import Plot sowie Download‑Links für die resultierenden CSVs.
+
+Ausführen (nachdem die Bibliotheken installiert sind)::
+
+    streamlit run streamlit_app.py
+
+Benötigte Pakete (siehe requirements.txt):
+    streamlit pandas numpy matplotlib pypsa highs
+"""
+
+import io
+from datetime import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pypsa
+import streamlit as st
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktionen (aus battery_sizing.py übernommen / leicht angepasst)
+# -----------------------------------------------------------------------------
+
+def read_profile(uploaded_file, resolution: str) -> pd.Series:
+    """Upload‑Datei (CSV) → pandas.Series(kW) resampled."""
+    df = pd.read_csv(uploaded_file, parse_dates=[0], index_col=0)
+    series = (
+        df.iloc[:, 0]
+        .astype(float)
+        .resample(resolution)
+        .mean()
+        .fillna(0.0)
+    )
+    series.index = series.index.tz_localize(
+        "Europe/Vienna", nonexistent="shift_forward", ambiguous="NaT"
+    )
+    return series
+
+
+def make_window_mask(index: pd.DatetimeIndex, start: time, end: time) -> pd.Series:
+    def in_window(ts):
+        local = ts.tz_convert("Europe/Vienna").time()
+        if start < end:
+            return start <= local < end
+        else:
+            return local >= start or local < end
+    return pd.Series([in_window(ts) for ts in index], index=index)
+
+
+def smart_ev_profile(base_net: pd.Series, pv: pd.Series, energy_kwh: float, power_kw: float, mask: pd.Series) -> pd.Series:
+    profile = pd.Series(0.0, index=base_net.index)
+    step_h = (profile.index[1] - profile.index[0]).total_seconds() / 3600.0
+
+    for day, group in profile.groupby(profile.index.date):
+        win_idx = group[mask[group.index]].index
+        if win_idx.empty:
+            continue
+        surplus = (-pv[win_idx]) - base_net[win_idx]
+        surplus = surplus.clip(lower=0.0)
+        order = surplus.sort_values(ascending=False).index
+        remaining = energy_kwh
+        for ts in order:
+            if remaining <= 1e-3:
+                break
+            cap = power_kw * step_h
+            charge = min(cap, remaining)
+            profile[ts] = charge / step_h
+            remaining -= charge
+        if remaining > 1e-3:  # not enough surplus, fill sequentially
+            for ts in win_idx:
+                if profile[ts] > 0:
+                    continue
+                cap = power_kw * step_h
+                charge = min(cap, remaining)
+                profile[ts] = charge / step_h
+                remaining -= charge
+                if remaining <= 1e-3:
+                    break
+    return profile
+
+
+def build_network(profiles, grid_kw):
+    n = pypsa.Network()
+    n.set_snapshots(profiles["load"].index)
+
+    n.add("Bus", "grid")
+    n.add("Line", "grid_limit", bus0="grid", bus1="grid", s_nom=grid_kw)
+    n.add("Load", "demand", bus="grid", p_set=profiles["load"].values)
+    n.add("Generator", "pv", bus="grid", p_set=-profiles["pv"].values, marginal_cost=0.0)
+    n.add("Load", "ev_cars", bus="grid", p_set=profiles["ev_cars"].values)
+    n.add("Load", "ev_trucks", bus="grid", p_set=profiles["ev_trucks"].values)
+    n.add(
+        "StorageUnit",
+        "battery",
+        bus="grid",
+        p_nom_extendable=True,
+        max_hours_extendable=True,
+        efficiency_store=0.95,
+        efficiency_dispatch=0.95,
+        capital_cost=0.0,
+        marginal_cost=0.0,
+    )
+    return n
+
+
+def add_battery_costs(n, cost_kwh, cost_kw):
+    n.objective += cost_kwh * n.storage_units["e_nom"].sum() + cost_kw * n.storage_units["p_nom"].sum()
+
+
+# -----------------------------------------------------------------------------
+# Streamlit UI
+# -----------------------------------------------------------------------------
+
+st.set_page_config(page_title="Battery Sizing Tool", layout="wide")
+st.title("🔋 Optimale Batteriegröße für Ihren Standort")
+
+st.sidebar.header("Basisparameter")
+resolution = st.sidebar.selectbox("Zeitauflösung", options=["15min", "60min"], index=0)
+gridsize = st.sidebar.number_input("Grid‑Anschlussleistung (kW)", min_value=10, value=800, step=10)
+capex_kwh = st.sidebar.number_input("CapEx €/kWh", min_value=0, value=350)
+capex_kw = st.sidebar.number_input("CapEx €/kW", min_value=0, value=150)
+
+st.sidebar.header("CSV‑Uploads")
+load_file = st.sidebar.file_uploader("Verbrauchsprofil (Load)")
+pv_file = st.sidebar.file_uploader("PV‑Erzeugung (optional)")
+
+st.sidebar.header("EV‑Laden – Smart‑Heuristik")
+smart_ev = st.sidebar.checkbox("Smart‑EV‑Charging aktiv", value=True)
+
+cars_energy = st.sidebar.number_input("Energiebedarf PKW pro Tag (kWh)", 0, 1000, 150)
+cars_power = st.sidebar.number_input("Ladeleistung PKW (kW)", 0, 350, 22)
+cars_start = st.sidebar.time_input("Start PKW‑Fenster", time(17, 0))
+cars_end = st.sidebar.time_input("Ende PKW‑Fenster", time(6, 0))
+
+trucks_energy = st.sidebar.number_input("Energiebedarf LKW pro Tag (kWh)", 0, 2000, 300)
+trucks_power = st.sidebar.number_input("Ladeleistung LKW (kW)", 0, 1000, 60)
+trucks_start = st.sidebar.time_input("Start LKW‑Fenster", time(20, 0))
+trucks_end = st.sidebar.time_input("Ende LKW‑Fenster", time(4, 0))
+
+run_btn = st.sidebar.button("🔄 Optimierung starten")
+
+if run_btn:
+    if load_file is None:
+        st.error("Bitte Verbrauchs‑CSV hochladen.")
+        st.stop()
+
+    load = read_profile(load_file, resolution)
+    pv = read_profile(pv_file, resolution) if pv_file else pd.Series(0.0, index=load.index)
+
+    profiles = {
+        "load": load,
+        "pv": pv,
+        "ev_cars": pd.Series(0.0, index=load.index),
+        "ev_trucks": pd.Series(0.0, index=load.index),
+    }
+
+    if smart_ev:
+        mask_cars = make_window_mask(load.index, cars_start, cars_end)
+        base_net = load + pv  # without EV yet
+        profiles["ev_cars"] = smart_ev_profile(base_net, pv, cars_energy, cars_power, mask_cars)
+        base_net += profiles["ev_cars"]
+        mask_trucks = make_window_mask(load.index, trucks_start, trucks_end)
+        profiles["ev_trucks"] = smart_ev_profile(base_net, pv, trucks_energy, trucks_power, mask_trucks)
+    else:
+        st.warning("Smart‑EV deaktiviert – EV‑Last bleibt 0 kW.")
+
+    net = build_network(profiles, gridsize)
+    add_battery_costs(net, capex_kwh, capex_kw)
+
+    with st.spinner("Optimierung läuft…"):
+        net.optimize(network_lopf_options={"solver_name": "highs"})
+
+    e_nom = net.storage_units.loc["battery", "e_nom_opt"]
+    p_nom = net.storage_units.loc["battery", "p_nom_opt"]
+
+    col1, col2 = st.columns(2)
+    col1.metric("Batterie‑Energie (kWh)", f"{e_nom:.1f}")
+    col2.metric("Batterie‑Leistung (kW)", f"{p_nom:.1f}")
+
+    soc = net.storage_units_t["state_of_charge"].loc[:, "battery"]
+    grid_import = net.loads_t["p"].sum(axis=1) + net.generators_t["p"].sum(axis=1) + soc.diff().fillna(0) / (
+        (soc.index[1] - soc.index[0]).total_seconds() / 3600.0
+    )
+
+    st.subheader("Zeitreihen")
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "Load", "PV", "EV Cars", "EV Trucks", "SOC & Grid Import"])
+
+    with tab1:
+        fig, ax = plt.subplots()
+        load.plot(ax=ax)
+        ax.set_title("Verbrauch"); ax.set_ylabel("kW")
+        st.pyplot(fig)
+
+    with tab2:
+        fig, ax = plt.subplots()
+        (-pv).plot(ax=ax)
+        ax.set_title("PV‑Erzeugung"); ax.set_ylabel("kW")
+        st.pyplot(fig)
+
+    with tab3:
+        fig, ax = plt.subplots()
+        profiles["ev_cars"].plot(ax=ax)
+        ax.set_title("PKW Laden"); ax.set_ylabel("kW")
+        st.pyplot(fig)
+
+    with tab4:
+        fig, ax = plt.subplots()
+        profiles["ev_trucks"].plot(ax=ax)
+        ax.set_title("LKW Laden"); ax.set_ylabel("kW")
+        st.pyplot(fig)
+
+    with tab5:
+        fig, ax = plt.subplots()
+        soc.plot(ax=ax, label="SOC (kWh)")
+        ax2 = ax.twinx()
+        grid_import.plot(ax=ax2, color="orange", label="Grid Import (kW)")
+        ax.set_ylabel("kWh")
+        ax2.set_ylabel("kW")
+        ax.set_title("Batterie‑Ladestand & Netzbezug")
+        ax.legend(loc="upper left"); ax2.legend(loc="upper right")
+        st.pyplot(fig)
+
+    # Downloads
+    st.subheader("Ergebnisse herunterladen")
+    csv_buf = io.StringIO()
+    soc.to_csv(csv_buf)
+    st.download_button("SOC‑CSV", data=csv_buf.getvalue(), file_name="battery_soc.csv")
