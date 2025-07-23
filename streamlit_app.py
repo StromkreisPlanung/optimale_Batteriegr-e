@@ -1,8 +1,12 @@
 """
-Streamlit‑App für Batterie‑Sizing (runtime‑safe)
-================================================
-* keine HiGHS‑Pflicht – PyPSA wählt GLPK oder vorhandenen Solver
-* läuft auf Streamlit Community Cloud mit Python 3.12
+Streamlit‑App für Battery‑Sizing  (Deutsch + CSV‑Autodetektion)
+================================================================
+Version 0.3 – erkennt Semikolon‑CSV mit Dezimal­komma **oder**
+Komma‑CSV mit Dezimalpunkt automatisch.
+
+Änderungen:
+* read_profile() prüft Kopfzeile, setzt sep / decimal / dayfirst.
+* Keine Anpassung an vorhandenen CSVs nötig – dt. Excel‑Datei funktioniert.
 """
 
 from __future__ import annotations
@@ -16,22 +20,46 @@ import pandas as pd
 import pypsa
 import streamlit as st
 
+# ------------------------------------------------------------------
+# Helfer: CSV robust einlesen
+# ------------------------------------------------------------------
 
-# ------------------------------------------------------------------ #
-# Helper functions                                                   #
-# ------------------------------------------------------------------ #
 def read_profile(upload, res: str) -> pd.Series:
-    df = pd.read_csv(upload, parse_dates=[0], index_col=0)
-    s = df.iloc[:, 0].astype(float).resample(res).mean().fillna(0.0)
-    s.index = s.index.tz_localize("Europe/Vienna", nonexistent="shift_forward", ambiguous="NaT")
-    return s
+    """Liest CSV mit entweder , oder ; als Trenner.
 
+    * Dezimalzeichen wird anhand Separator gesetzt (',' → decimal=',').
+    * dd.mm.yyyy wird via dayfirst=True geparst.
+    """
+    raw = upload.getvalue().decode("utf-8-sig")
+    header = raw.splitlines()[0]
+    use_semicolon = ";" in header
+    sep = ";" if use_semicolon else ","
+    decimal = "," if use_semicolon else "."
+
+    df = pd.read_csv(
+        io.StringIO(raw),
+        sep=sep,
+        decimal=decimal,
+        parse_dates=[0],
+        dayfirst=use_semicolon,  # typisch dt. Format
+        engine="python",
+    )
+    # erste nicht‑Datetime Spalte ist Leistung
+    power = df.iloc[:, 1].astype(float)
+    series = power.resample(res, on=df.columns[0]).mean().fillna(0.0)
+    series.index = series.index.tz_localize(
+        "Europe/Vienna", nonexistent="shift_forward", ambiguous="NaT"
+    )
+    return series
+
+# ------------------------------------------------------------------
+# EV‑Heuristik & Netzmodell (wie zuvor, unverändert)
+# ------------------------------------------------------------------
 
 def window_mask(index, start: time, end: time) -> pd.Series:
     def inside(ts):
         t = ts.tz_convert("Europe/Vienna").time()
         return (start <= t < end) if start < end else (t >= start or t < end)
-
     return pd.Series([inside(ts) for ts in index], index=index)
 
 
@@ -92,51 +120,59 @@ def network(p: dict[str, pd.Series], grid_kw):
 def capex(n, c_kwh, c_kw):
     n.objective += c_kwh * n.storage_units["e_nom"].sum() + c_kw * n.storage_units["p_nom"].sum()
 
+# ------------------------------------------------------------------
+# Streamlit UI
+# ------------------------------------------------------------------
 
-# ------------------------------------------------------------------ #
-# Streamlit UI                                                      #
-# ------------------------------------------------------------------ #
-st.set_page_config(page_title="Battery Sizing Tool", layout="wide")
-st.title("🔋 Optimale Batteriegröße bestimmen")
+st.set_page_config(page_title="Battery Sizing Tool", layout="wide")
+st.title("🔋 Optimale Batteriegröße bestimmen (CSV auto‑detect)")
 
 sidebar = st.sidebar
 sidebar.header("Basisparameter")
 res = sidebar.selectbox("Zeitauflösung", ["15min", "60min"], 0)
 grid_kw = sidebar.number_input("Grid‑Anschluss (kW)", 10, None, 800, 10)
-cap_kwh = sidebar.number_input("CapEx €/kWh", 0, None, 350)
-cap_kw = sidebar.number_input("CapEx €/kW", 0, None, 150)
+cap_kwh = sidebar.number_input("CapEx €/kWh", 0, None, 350)
+cap_kw = sidebar.number_input("CapEx €/kW", 0, None, 150)
 
 sidebar.header("CSV‑Uploads")
-load_file = sidebar.file_uploader("Verbrauch CSV")
-pv_file = sidebar.file_uploader("PV CSV (optional)")
+load_file = sidebar.file_uploader("Verbrauchs‑CSV")
+pv_file = sidebar.file_uploader("PV‑CSV (optional)")
 
 sidebar.header("EV‑Ladefenster (Smart)")
 smart = sidebar.checkbox("Smart‑Charging aktiv", True)
+
 cars_e = sidebar.number_input("PKW‑Energie/Tag (kWh)", 0, 2000, 150)
 cars_p = sidebar.number_input("PKW‑Leistung (kW)", 0, 350, 22)
 cars_s = sidebar.time_input("PKW‑Start", time(17))
 cars_e_t = sidebar.time_input("PKW‑Ende", time(6))
+
 trucks_e = sidebar.number_input("LKW‑Energie/Tag (kWh)", 0, 4000, 300)
 trucks_p = sidebar.number_input("LKW‑Leistung (kW)", 0, 1000, 60)
 trucks_s = sidebar.time_input("LKW‑Start", time(20))
 trucks_e_t = sidebar.time_input("LKW‑Ende", time(4))
 
-run = sidebar.button("🚀 Optimieren")
+run = sidebar.button("🚀 Optimieren")
 
 if run:
     if load_file is None:
         st.error("Bitte Verbrauchs‑CSV hochladen.")
         st.stop()
 
-    load = read_profile(load_file, res)
-    pv = read_profile(pv_file, res) if pv_file else pd.Series(0.0, index=load.index)
+    try:
+        load = read_profile(load_file, res)
+    except Exception as e:
+        st.error(f"Fehler beim Einlesen der Last‑CSV: {e}")
+        st.stop()
 
-    prof = {
-        "load": load,
-        "pv": pv,
-        "ev_cars": pd.Series(0.0, index=load.index),
-        "ev_trucks": pd.Series(0.0, index=load.index),
-    }
+    pv = pd.Series(0.0, index=load.index)
+    if pv_file is not None:
+        try:
+            pv = read_profile(pv_file, res)
+        except Exception as e:
+            st.error(f"Fehler beim Einlesen der PV‑CSV: {e}")
+            st.stop()
+
+    prof = {"load": load, "pv": pv, "ev_cars": pd.Series(0.0, index=load.index), "ev_trucks": pd.Series(0.0, index=load.index)}
 
     if smart:
         mask_c = window_mask(load.index, cars_s, cars_e_t)
