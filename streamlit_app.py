@@ -25,14 +25,13 @@ import streamlit as st
 # ------------------------------------------------------------------
 
 def read_profile(upload, res: str) -> pd.Series:
-    """Liest CSV mit entweder , oder ; als Trenner.
+    """Robust CSV-Reader, akzeptiert Semikolon+Komma oder Komma+Punkt.
 
-    * Dezimalzeichen wird anhand Separator gesetzt (',' → decimal=',').
-    * dd.mm.yyyy wird via dayfirst=True geparst.
+    Gibt eine kW-Serie mit dem gewünschten Zeitschritt zurück.
     """
     raw = upload.getvalue().decode("utf-8-sig")
     header = raw.splitlines()[0]
-    use_semicolon = ";" in header
+    use_semicolon = ";" in header  # dt. Excel
     sep = ";" if use_semicolon else ","
     decimal = "," if use_semicolon else "."
 
@@ -40,13 +39,16 @@ def read_profile(upload, res: str) -> pd.Series:
         io.StringIO(raw),
         sep=sep,
         decimal=decimal,
-        parse_dates=[0],
-        dayfirst=use_semicolon,  # typisch dt. Format
+        header=0,
+        names=["datetime", "power_kw"],  # erzwingt konsistente Namen
+        parse_dates=["datetime"],
+        dayfirst=use_semicolon,
         engine="python",
     )
-    # erste nicht‑Datetime Spalte ist Leistung
-    power = df.iloc[:, 1].astype(float)
-    series = power.resample(res, on=df.columns[0]).mean().fillna(0.0)
+
+    # Datetime als Index -> resample -> Serie zurück
+    df.set_index("datetime", inplace=True)
+    series = df["power_kw"].resample(res).mean().fillna(0.0)
     series.index = series.index.tz_localize(
         "Europe/Vienna", nonexistent="shift_forward", ambiguous="NaT"
     )
