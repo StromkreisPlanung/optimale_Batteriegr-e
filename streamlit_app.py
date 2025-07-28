@@ -57,11 +57,11 @@ def read_profile(upload, res: str) -> pd.Series:
     s = df["power_kw"].resample(res).mean().fillna(0.0)
 
     # Zeitzone setzen – 'infer' löst die Herbst-Umstellung ohne doppelte Labels
-    s.index = s.index.tz_localize(
-        "Europe/Vienna",
-        nonexistent="shift_forward",  # Frühlingssprung
-        ambiguous="infer",            # Herbst (doppelte Uhrzeit) automatisch erkennen
-    )
+   s.index = s.index.tz_localize(
+    "Europe/Vienna",
+    nonexistent="shift_forward",
+    ambiguous=False,   # => 2:00 auf Winterzeit (CET) interpretieren
+)
     return s
 
 # ------------------------------------------------------------- #
