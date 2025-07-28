@@ -1,12 +1,13 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.4
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.5
 ===================================================
 • Mehrere PV‑CSV‑Dateien werden addiert
 • Robuster CSV‑Reader (Semikolon/Komma + Dezimalpunkt/-komma)
 • DST-Fix: Europe/Vienna korrekt behandeln, PyPSA bekommt tz‑naive Snapshots
 • Smart‑EV‑Charging: index-sicher (kein reindex, sondern isin)
 • Page‑Config‑Guard: Doppelaufrufe abgefangen
+• PyPSA: p_set-Zeitreihen werden NACH dem Add gesetzt (keine Längenfehler)
 """
 
 import io
@@ -141,16 +142,40 @@ def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd
 # 3) PyPSA‑Netzmodell                                            #
 # ------------------------------------------------------------- #
 def build_network(p: dict[str, pd.Series], grid_kw: float) -> pypsa.Network:
+    """
+    Wichtig: Zeitreihen erst NACH dem Hinzufügen der Komponenten setzen.
+    So sind Länge und Index garantiert identisch zu n.snapshots.
+    """
     n = pypsa.Network()
-    n.set_snapshots(p["load"].index)   # tz‑naiv
+    snaps = p["load"].index               # tz‑naiv
+    n.set_snapshots(snaps)
+
     n.add("Bus", "grid")
     n.add("Line", "limit", bus0="grid", bus1="grid", s_nom=grid_kw)
 
-    n.add("Load", "demand", bus="grid", p_set=p["load"].values)
-    n.add("Generator", "pv", bus="grid", p_set=-p["pv"].values, marginal_cost=0.0)
-    n.add("Load", "ev_cars", bus="grid", p_set=p["ev_cars"].values)
-    n.add("Load", "ev_trucks", bus="grid", p_set=p["ev_trucks"].values)
+    # Komponenten ohne p_set anlegen
+    n.add("Load", "demand",   bus="grid")
+    n.add("Load", "ev_cars",  bus="grid")
+    n.add("Load", "ev_trucks",bus="grid")
+    n.add("Generator", "pv",  bus="grid", marginal_cost=0.0)
 
+    # Zeitreihen setzen (sauber ausgerichtet auf snaps)
+    n.loads_t.p_set = pd.DataFrame(
+        index=snaps,
+        data={
+            "demand":    p["load"].reindex(snaps).fillna(0.0).values,
+            "ev_cars":   p["ev_cars"].reindex(snaps).fillna(0.0).values,
+            "ev_trucks": p["ev_trucks"].reindex(snaps).fillna(0.0).values,
+        },
+    )
+    n.generators_t.p_set = pd.DataFrame(
+        index=snaps,
+        data={
+            "pv": -p["pv"].reindex(snaps).fillna(0.0).values
+        },
+    )
+
+    # Speicher
     n.add(
         "StorageUnit",
         "battery",
