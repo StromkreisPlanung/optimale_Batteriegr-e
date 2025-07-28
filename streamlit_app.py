@@ -1,28 +1,28 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6
-=================================================
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.1
+===================================================
 • Mehrere PV‑CSV‑Dateien werden addiert
-• CSV‑Auto‑Erkennung (;/,, Dezimalpunkt/-komma)
+• Robuster CSV‑Reader (Semikolon/Komma + Dezimalpunkt/-komma)
 • Smart‑EV‑Charging (Index‑Align‑Fix)
-• Page‑Config nur einmal gesetzt (Session‑State‑Guard)
+• Page‑Config‑Guard: Doppelaufrufe werden abgefangen
 """
 
 import io
 from datetime import time
-from pathlib import Path
-
 import matplotlib.pyplot as plt
 import pandas as pd
 import pypsa
 import streamlit as st
 
 # ------------------------------------------------------------- #
-# 0. Page‑Config (nur einmal pro Session)                        #
+# 0. Page‑Config‑Guard                                          #
 # ------------------------------------------------------------- #
-if "page_cfg_done" not in st.session_state:
+try:
     st.set_page_config(page_title="Battery Sizing Tool", layout="wide")
-    st.session_state["page_cfg_done"] = True
+except st.errors.StreamlitAPIException:
+    # Page‑Config wurde bereits gesetzt (z. B. durch Streamlit Cloud)
+    pass
 
 # ------------------------------------------------------------- #
 # 1. CSV‑Reader                                                 #
@@ -61,7 +61,7 @@ def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd
     out = pd.Series(0.0, index=base.index)
     h = (out.index[1] - out.index[0]).total_seconds() / 3600
     for _, grp in out.groupby(out.index.date):
-        win = mask.reindex(grp.index, fill_value=False)  # Align‑Fix
+        win = mask.reindex(grp.index, fill_value=False)
         idx = grp.index[win]
         if idx.empty:
             continue
@@ -117,7 +117,7 @@ def add_capex(n: pypsa.Network, c_kwh: float, c_kw: float):
     n.objective += c_kwh * n.storage_units["e_nom"].sum() + c_kw * n.storage_units["p_nom"].sum()
 
 # ------------------------------------------------------------- #
-# 4. Streamlit UI                                               #
+# 4. Streamlit‑UI                                               #
 # ------------------------------------------------------------- #
 st.title("🔋 Optimale Batteriegröße bestimmen")
 
