@@ -1,11 +1,11 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.2
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.3
 ===================================================
 • Mehrere PV‑CSV‑Dateien werden addiert
 • Robuster CSV‑Reader (Semikolon/Komma + Dezimalpunkt/-komma)
-• Zeitzone: Europe/Vienna mit ambiguous='infer' (keine NaT/duplizierten Labels)
-• Smart‑EV‑Charging: Index-sicher (keine .reindex, sondern .isin)
+• Zeitumstellung: Europe/Vienna mit ambiguous=False (deterministisch CET)
+• Smart‑EV‑Charging: index-sicher (kein reindex, sondern isin)
 • Page‑Config‑Guard: Doppelaufrufe abgefangen
 """
 
@@ -23,6 +23,7 @@ import streamlit as st
 try:
     st.set_page_config(page_title="Battery Sizing Tool", layout="wide")
 except st.errors.StreamlitAPIException:
+    # Page-Config wurde bereits gesetzt (z. B. durch Cloud)
     pass
 
 # ------------------------------------------------------------- #
@@ -35,9 +36,10 @@ def read_profile(upload, res: str) -> pd.Series:
         2025-01-01 00:15,123.4
     """
     raw = upload.getvalue().decode("utf-8-sig")
-    header = raw.splitlines()[0]
+    header = raw.splitlines()[0] if raw else "datetime,power_kw"
     semicolon = ";" in header
     sep, dec = (";", ",") if semicolon else (",", ".")
+
     df = pd.read_csv(
         io.StringIO(raw),
         sep=sep,
@@ -49,19 +51,19 @@ def read_profile(upload, res: str) -> pd.Series:
         engine="python",
     )
 
-    # Duplikate im Zeitstempel ggf. aggregieren (Mittelwert) – robust gegen doppelte Zeilen
+    # Doppelte Zeitstempel (z. B. bei Datenzusammenführung) vorher mitteln
     df = df.groupby("datetime", as_index=False)["power_kw"].mean()
 
     # Index setzen und resamplen
     df.set_index("datetime", inplace=True)
     s = df["power_kw"].resample(res).mean().fillna(0.0)
 
-    # Zeitzone setzen – 'infer' löst die Herbst-Umstellung ohne doppelte Labels
-   s.index = s.index.tz_localize(
-    "Europe/Vienna",
-    nonexistent="shift_forward",
-    ambiguous=False,   # => 2:00 auf Winterzeit (CET) interpretieren
-)
+    # Zeitzone setzen – deterministisch Winterzeit (CET) bei 2:00 im Oktober
+    s.index = s.index.tz_localize(
+        "Europe/Vienna",
+        nonexistent="shift_forward",  # Frühlingssprung
+        ambiguous=False,              # Herbst: 02:00 als Winterzeit
+    )
     return s
 
 # ------------------------------------------------------------- #
@@ -254,5 +256,6 @@ if run:
 
     # Download‑CSV
     st.subheader("SOC‑CSV herunterladen")
-    buf = io.StringIO(); soc.to_csv(buf)
+    buf = io.StringIO()
+    soc.to_csv(buf)
     st.download_button("Download CSV", buf.getvalue(), file_name="battery_soc.csv")
