@@ -1,35 +1,42 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.1
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.2
 ===================================================
 • Mehrere PV‑CSV‑Dateien werden addiert
 • Robuster CSV‑Reader (Semikolon/Komma + Dezimalpunkt/-komma)
-• Smart‑EV‑Charging (Index‑Align‑Fix)
-• Page‑Config‑Guard: Doppelaufrufe werden abgefangen
+• Zeitzone: Europe/Vienna mit ambiguous='infer' (keine NaT/duplizierten Labels)
+• Smart‑EV‑Charging: Index-sicher (keine .reindex, sondern .isin)
+• Page‑Config‑Guard: Doppelaufrufe abgefangen
 """
 
 import io
 from datetime import time
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import pypsa
 import streamlit as st
 
 # ------------------------------------------------------------- #
-# 0. Page‑Config‑Guard                                          #
+# 0) Page‑Config nur einmal setzen                               #
 # ------------------------------------------------------------- #
 try:
     st.set_page_config(page_title="Battery Sizing Tool", layout="wide")
 except st.errors.StreamlitAPIException:
-    # Page‑Config wurde bereits gesetzt (z. B. durch Streamlit Cloud)
     pass
 
 # ------------------------------------------------------------- #
-# 1. CSV‑Reader                                                 #
+# 1) CSV‑Reader                                                  #
 # ------------------------------------------------------------- #
 def read_profile(upload, res: str) -> pd.Series:
+    """
+    Erwartetes CSV:
+        datetime,power_kw        (oder Semikolon + Dezimalkomma)
+        2025-01-01 00:15,123.4
+    """
     raw = upload.getvalue().decode("utf-8-sig")
-    semicolon = ";" in raw.splitlines()[0]
+    header = raw.splitlines()[0]
+    semicolon = ";" in header
     sep, dec = (";", ",") if semicolon else (",", ".")
     df = pd.read_csv(
         io.StringIO(raw),
@@ -38,18 +45,27 @@ def read_profile(upload, res: str) -> pd.Series:
         names=["datetime", "power_kw"],
         header=0,
         parse_dates=["datetime"],
-        dayfirst=semicolon,
+        dayfirst=semicolon,   # dt. Format 01.01.2025 …
         engine="python",
     )
+
+    # Duplikate im Zeitstempel ggf. aggregieren (Mittelwert) – robust gegen doppelte Zeilen
+    df = df.groupby("datetime", as_index=False)["power_kw"].mean()
+
+    # Index setzen und resamplen
     df.set_index("datetime", inplace=True)
     s = df["power_kw"].resample(res).mean().fillna(0.0)
+
+    # Zeitzone setzen – 'infer' löst die Herbst-Umstellung ohne doppelte Labels
     s.index = s.index.tz_localize(
-        "Europe/Vienna", nonexistent="shift_forward", ambiguous="NaT"
+        "Europe/Vienna",
+        nonexistent="shift_forward",  # Frühlingssprung
+        ambiguous="infer",            # Herbst (doppelte Uhrzeit) automatisch erkennen
     )
     return s
 
 # ------------------------------------------------------------- #
-# 2. Smart‑EV‑Algorithmus                                       #
+# 2) Smart‑EV‑Algorithmus (index‑sicher)                         #
 # ------------------------------------------------------------- #
 def window_mask(index, start: time, end: time) -> pd.Series:
     def inside(ts):
@@ -58,16 +74,27 @@ def window_mask(index, start: time, end: time) -> pd.Series:
     return pd.Series([inside(ts) for ts in index], index=index)
 
 def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd.Series):
+    """
+    Greedy: lädt zuerst in Zeitpunkte mit größtem PV‑Überschuss.
+    Verwendet .isin statt .reindex – dadurch robust bei doppelten Index‑Labels.
+    """
     out = pd.Series(0.0, index=base.index)
-    h = (out.index[1] - out.index[0]).total_seconds() / 3600
+    h = (out.index[1] - out.index[0]).total_seconds() / 3600.0
+
+    # Index der True‑Mask vorab holen
+    true_idx = mask.index[mask]
+
     for _, grp in out.groupby(out.index.date):
-        win = mask.reindex(grp.index, fill_value=False)
-        idx = grp.index[win]
-        if idx.empty:
+        # bool‑Array für das Tagesfenster – keine Reindexierung nötig
+        win_bool = grp.index.isin(true_idx)
+        idx = grp.index[win_bool]
+        if len(idx) == 0:
             continue
+
         surplus = (-pv[idx]) - base[idx]
-        surplus.clip(lower=0.0, inplace=True)
+        surplus = surplus.clip(lower=0.0)
         order = surplus.sort_values(ascending=False).index
+
         rem = e_kwh
         for ts in order:
             if rem <= 1e-3:
@@ -89,17 +116,19 @@ def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd
     return out
 
 # ------------------------------------------------------------- #
-# 3. PyPSA‑Netzmodell                                           #
+# 3) PyPSA‑Netzmodell                                            #
 # ------------------------------------------------------------- #
 def build_network(p: dict[str, pd.Series], grid_kw: float) -> pypsa.Network:
     n = pypsa.Network()
     n.set_snapshots(p["load"].index)
     n.add("Bus", "grid")
     n.add("Line", "limit", bus0="grid", bus1="grid", s_nom=grid_kw)
+
     n.add("Load", "demand", bus="grid", p_set=p["load"].values)
     n.add("Generator", "pv", bus="grid", p_set=-p["pv"].values, marginal_cost=0.0)
     n.add("Load", "ev_cars", bus="grid", p_set=p["ev_cars"].values)
     n.add("Load", "ev_trucks", bus="grid", p_set=p["ev_trucks"].values)
+
     n.add(
         "StorageUnit",
         "battery",
@@ -117,7 +146,7 @@ def add_capex(n: pypsa.Network, c_kwh: float, c_kw: float):
     n.objective += c_kwh * n.storage_units["e_nom"].sum() + c_kw * n.storage_units["p_nom"].sum()
 
 # ------------------------------------------------------------- #
-# 4. Streamlit‑UI                                               #
+# 4) Streamlit‑UI                                                #
 # ------------------------------------------------------------- #
 st.title("🔋 Optimale Batteriegröße bestimmen")
 
@@ -133,10 +162,10 @@ load_file = sb.file_uploader("Verbrauchs‑CSV (Pflicht)")
 pv_files  = sb.file_uploader("PV‑CSV‑Dateien (optional, mehrere)", accept_multiple_files=True)
 
 sb.header("EV‑Ladefenster (Smart)")
-smart  = sb.checkbox("Smart‑Charging aktiv", True)
-cars_e = sb.number_input("PKW‑Energie/Tag (kWh)", 0, 2000, 150)
-cars_p = sb.number_input("PKW‑Leistung (kW)", 0, 350, 22)
-cars_s = sb.time_input("PKW‑Start", time(17))
+smart    = sb.checkbox("Smart‑Charging aktiv", True)
+cars_e   = sb.number_input("PKW‑Energie/Tag (kWh)", 0, 2000, 150)
+cars_p   = sb.number_input("PKW‑Leistung (kW)", 0, 350, 22)
+cars_s   = sb.time_input("PKW‑Start", time(17))
 cars_e_t = sb.time_input("PKW‑Ende", time(6))
 trucks_e = sb.number_input("LKW‑Energie/Tag (kWh)", 0, 4000, 300)
 trucks_p = sb.number_input("LKW‑Leistung (kW)", 0, 1000, 60)
@@ -146,7 +175,7 @@ trucks_e_t = sb.time_input("LKW‑Ende", time(4))
 run = sb.button("🚀 Optimieren")
 
 # ------------------------------------------------------------- #
-# 5. Daten einlesen & Optimierung                               #
+# 5) Daten einlesen & Optimierung                                #
 # ------------------------------------------------------------- #
 if run:
     if load_file is None:
@@ -202,6 +231,7 @@ if run:
         + soc.diff().fillna(0) / ((soc.index[1] - soc.index[0]).total_seconds() / 3600)
     )
 
+    # Plots
     st.subheader("Zeitreihen")
     tabs = st.tabs(["Load", "PV", "EV Cars", "EV Trucks", "SOC + Grid"])
     plots = [load, -pv, prof["ev_cars"], prof["ev_trucks"]]
@@ -217,11 +247,12 @@ if run:
         fig, ax = plt.subplots()
         soc.plot(ax=ax, label="SOC (kWh)")
         ax2 = ax.twinx()
-        grid_imp.plot(ax=ax2, color="orange", label="Grid (kW)")
+        grid_imp.plot(ax=ax2, label="Grid (kW)")
         ax.set_ylabel("kWh"); ax2.set_ylabel("kW")
         ax.legend(loc="upper left"); ax2.legend(loc="upper right")
         st.pyplot(fig)
 
+    # Download‑CSV
     st.subheader("SOC‑CSV herunterladen")
     buf = io.StringIO(); soc.to_csv(buf)
     st.download_button("Download CSV", buf.getvalue(), file_name="battery_soc.csv")
