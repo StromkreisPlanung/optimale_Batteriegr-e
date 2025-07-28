@@ -1,10 +1,10 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.3
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.4
 ===================================================
 • Mehrere PV‑CSV‑Dateien werden addiert
 • Robuster CSV‑Reader (Semikolon/Komma + Dezimalpunkt/-komma)
-• Zeitumstellung: Europe/Vienna mit ambiguous=False (deterministisch CET)
+• DST-Fix: Europe/Vienna korrekt behandeln, PyPSA bekommt tz‑naive Snapshots
 • Smart‑EV‑Charging: index-sicher (kein reindex, sondern isin)
 • Page‑Config‑Guard: Doppelaufrufe abgefangen
 """
@@ -51,29 +51,49 @@ def read_profile(upload, res: str) -> pd.Series:
         engine="python",
     )
 
-    # Doppelte Zeitstempel (z. B. bei Datenzusammenführung) vorher mitteln
+    # Doppelte Zeitstempel vorher mitteln (z. B. bei Mehrfach-Uploads)
     df = df.groupby("datetime", as_index=False)["power_kw"].mean()
 
     # Index setzen und resamplen
     df.set_index("datetime", inplace=True)
     s = df["power_kw"].resample(res).mean().fillna(0.0)
 
-    # Zeitzone setzen – deterministisch Winterzeit (CET) bei 2:00 im Oktober
+    # 1) TZ korrekt anwenden (DST beachten) ...
     s.index = s.index.tz_localize(
         "Europe/Vienna",
         nonexistent="shift_forward",  # Frühlingssprung
-        ambiguous=False,              # Herbst: 02:00 als Winterzeit
+        ambiguous=False,              # Herbst: doppelte Stunde als Winterzeit (CET)
     )
+    # 2) ... und TZ wieder entfernen (PyPSA erwartet tz‑naive Snapshots)
+    s.index = s.index.tz_localize(None)
+
     return s
 
 # ------------------------------------------------------------- #
 # 2) Smart‑EV‑Algorithmus (index‑sicher)                         #
 # ------------------------------------------------------------- #
 def window_mask(index, start: time, end: time) -> pd.Series:
+    """
+    Erzeugt eine boolesche Maske auf dem ORIGINAL-Index.
+    Für die Zeitfensterlogik wird temporär Europe/Vienna lokalisiert.
+    """
+    # temporär tz‑aware Index bauen
+    if getattr(index, "tz", None) is None:
+        idx_tz = index.tz_localize(
+            "Europe/Vienna",
+            nonexistent="shift_forward",
+            ambiguous=False,
+        )
+    else:
+        idx_tz = index.tz_convert("Europe/Vienna")
+
     def inside(ts):
-        t = ts.tz_convert("Europe/Vienna").time()
+        t = ts.time()
         return (start <= t < end) if start < end else (t >= start or t < end)
-    return pd.Series([inside(ts) for ts in index], index=index)
+
+    vals = [inside(ts) for ts in idx_tz]
+    # Wichtig: Maske mit dem ursprünglichen (tz‑naiven) Index zurückgeben
+    return pd.Series(vals, index=index)
 
 def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd.Series):
     """
@@ -122,7 +142,7 @@ def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd
 # ------------------------------------------------------------- #
 def build_network(p: dict[str, pd.Series], grid_kw: float) -> pypsa.Network:
     n = pypsa.Network()
-    n.set_snapshots(p["load"].index)
+    n.set_snapshots(p["load"].index)   # tz‑naiv
     n.add("Bus", "grid")
     n.add("Line", "limit", bus0="grid", bus1="grid", s_nom=grid_kw)
 
