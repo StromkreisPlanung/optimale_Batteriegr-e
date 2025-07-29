@@ -1,13 +1,13 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.5
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.6
 ===================================================
 • Mehrere PV‑CSV‑Dateien werden addiert
 • Robuster CSV‑Reader (Semikolon/Komma + Dezimalpunkt/-komma)
 • DST-Fix: Europe/Vienna korrekt behandeln, PyPSA bekommt tz‑naive Snapshots
 • Smart‑EV‑Charging: index-sicher (kein reindex, sondern isin)
 • Page‑Config‑Guard: Doppelaufrufe abgefangen
-• PyPSA: p_set-Zeitreihen werden NACH dem Add gesetzt (keine Längenfehler)
+• PyPSA: p_set-Zeitreihen NACH dem Add gesetzt + Duplikate bereinigt
 """
 
 import io
@@ -142,37 +142,46 @@ def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd
 # 3) PyPSA‑Netzmodell                                            #
 # ------------------------------------------------------------- #
 def build_network(p: dict[str, pd.Series], grid_kw: float) -> pypsa.Network:
-    """
-    Wichtig: Zeitreihen erst NACH dem Hinzufügen der Komponenten setzen.
-    So sind Länge und Index garantiert identisch zu n.snapshots.
-    """
+    """Zeitreihen defensiv bereinigen und erst NACH dem Add setzen."""
+    def sanitize(s: pd.Series, snaps: pd.DatetimeIndex) -> pd.Series:
+        # Doppelte Zeitstempel mitteln, sortieren, tz-naiv, auf Snapshots ausrichten
+        s = s.groupby(level=0).mean()
+        s = s.sort_index()
+        if getattr(s.index, "tz", None) is not None:
+            s.index = s.index.tz_localize(None)
+        return s.reindex(snaps).fillna(0.0)
+
     n = pypsa.Network()
-    snaps = p["load"].index               # tz‑naiv
+    # Snapshots aus Last ableiten, unique & sortiert
+    snaps = pd.Index(p["load"].index).drop_duplicates(keep="first")
+    snaps = snaps.sort_values()
     n.set_snapshots(snaps)
 
+    # Komponenten ohne p_set anlegen
     n.add("Bus", "grid")
     n.add("Line", "limit", bus0="grid", bus1="grid", s_nom=grid_kw)
-
-    # Komponenten ohne p_set anlegen
     n.add("Load", "demand",   bus="grid")
     n.add("Load", "ev_cars",  bus="grid")
     n.add("Load", "ev_trucks",bus="grid")
     n.add("Generator", "pv",  bus="grid", marginal_cost=0.0)
 
-    # Zeitreihen setzen (sauber ausgerichtet auf snaps)
+    # Zeitreihen sauber einsetzen
+    load_s   = sanitize(p["load"], snaps)
+    ev_cars  = sanitize(p["ev_cars"], snaps)
+    ev_truck = sanitize(p["ev_trucks"], snaps)
+    pv_s     = sanitize(p["pv"], snaps)
+
     n.loads_t.p_set = pd.DataFrame(
         index=snaps,
         data={
-            "demand":    p["load"].reindex(snaps).fillna(0.0).values,
-            "ev_cars":   p["ev_cars"].reindex(snaps).fillna(0.0).values,
-            "ev_trucks": p["ev_trucks"].reindex(snaps).fillna(0.0).values,
+            "demand":    load_s.values,
+            "ev_cars":   ev_cars.values,
+            "ev_trucks": ev_truck.values,
         },
     )
     n.generators_t.p_set = pd.DataFrame(
         index=snaps,
-        data={
-            "pv": -p["pv"].reindex(snaps).fillna(0.0).values
-        },
+        data={"pv": (-pv_s).values},   # Erzeugung als negative Last
     )
 
     # Speicher
@@ -244,12 +253,17 @@ if run:
                 st.error(f"Fehler in PV‑Datei {f.name}: {e}")
                 st.stop()
 
+    # Diagnose: Duplikat-Hinweise
     prof = {
         "load": load,
         "pv": pv,
         "ev_cars": pd.Series(0.0, index=load.index),
         "ev_trucks": pd.Series(0.0, index=load.index),
     }
+    for name, s in prof.items():
+        dups = int(pd.Index(s.index).duplicated().sum())
+        if dups:
+            st.warning(f"{name}: {dups} doppelte Zeitstempel bereinigt.")
 
     if smart:
         mask_c = window_mask(load.index, cars_s, cars_e_t)
