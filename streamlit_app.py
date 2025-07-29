@@ -1,12 +1,15 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.7
-– Mehrere PV‑CSV (aufsummiert)
-– Robuster CSV‑Reader (Semikolon/Komma, Dezimalpunkt/-komma)
-– DST-Fix (Europe/Vienna), PyPSA bekommt tz‑naive Snapshots
-– Smart‑EV ohne reindex (duplikat‑sicher)
-– Page‑Config‑Guard
-– Matplotlib-Fallback + Versionsanzeige in der Sidebar
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.8
+===================================================
+• Mehrere PV‑CSV‑Dateien werden addiert
+• Robuster CSV‑Reader (Semikolon/Komma, Dezimalpunkt/-komma)
+• DST-Fix (Europe/Vienna), PyPSA bekommt tz‑naive Snapshots
+• Smart‑EV ohne reindex (duplikat‑sicher)
+• Page‑Config‑Guard
+• Matplotlib-Fallback + Versionsanzeige
+• CapEx: direkt an StorageUnit über capital_cost = cap_kw + cap_kwh * max_hours
+  → Optimiert kW; Energie = p_nom_opt * max_hours
 """
 
 import io
@@ -132,7 +135,10 @@ def smart_ev(base: pd.Series, pv: pd.Series, e_kwh: float, p_kw: float, mask: pd
     return out
 
 # ------------------- PyPSA-Netz (defensiv) ---------------- #
-def build_network(p: dict[str, pd.Series], grid_kw: float) -> pypsa.Network:
+def build_network(p: dict[str, pd.Series], grid_kw: float, cap_kwh: float, cap_kw: float, h_batt: float) -> pypsa.Network:
+    """Zeitreihen defensiv bereinigen und erst NACH dem Add setzen.
+       CapEx direkt an StorageUnit über capital_cost = cap_kw + cap_kwh * h_batt.
+    """
     def sanitize(s: pd.Series, snaps: pd.DatetimeIndex) -> pd.Series:
         s = s.groupby(level=0).mean()
         s = s.sort_index()
@@ -166,21 +172,20 @@ def build_network(p: dict[str, pd.Series], grid_kw: float) -> pypsa.Network:
     )
     n.generators_t.p_set = pd.DataFrame(index=snaps, data={"pv": (-pv_s).values})
 
+    # Batterie: feste Dauer (max_hours) und effektiver €/kW-Kostensatz
+    cap_eff_kw = cap_kw + cap_kwh * h_batt  # €/kW_eff
     n.add(
         "StorageUnit",
         "battery",
         bus="grid",
         p_nom_extendable=True,
-        max_hours_extendable=True,
+        max_hours=h_batt,                # feste Energiedauer
         efficiency_store=0.95,
         efficiency_dispatch=0.95,
-        capital_cost=0.0,
+        capital_cost=cap_eff_kw,         # Kosten wirken auf p_nom_opt
         marginal_cost=0.0,
     )
     return n
-
-def add_capex(n: pypsa.Network, c_kwh: float, c_kw: float):
-    n.objective += c_kwh * n.storage_units["e_nom"].sum() + c_kw * n.storage_units["p_nom"].sum()
 
 # ----------------------- UI ------------------------------- #
 st.title("🔋 Optimale Batteriegröße bestimmen")
@@ -188,9 +193,10 @@ st.title("🔋 Optimale Batteriegröße bestimmen")
 sb = st.sidebar
 sb.header("Basisparameter")
 res      = sb.selectbox("Zeitauflösung", ["15min", "60min"], 0)
-grid_kw  = sb.number_input("Grid‑Anschluss (kW)", 10, None, 800, 10)
-cap_kwh  = sb.number_input("CapEx €/kWh", 0, None, 350)
-cap_kw   = sb.number_input("CapEx €/kW", 0, None, 150)
+grid_kw  = sb.number_input("Grid‑Anschluss (kW)", min_value=10, value=800, step=10)
+cap_kwh  = sb.number_input("CapEx €/kWh", min_value=0, value=350)
+cap_kw   = sb.number_input("CapEx €/kW",  min_value=0, value=150)
+h_batt   = sb.number_input("Batteriedauer max_hours (h)", min_value=0.25, max_value=12.0, value=2.0, step=0.25)
 
 sb.header("CSV‑Uploads")
 load_file = sb.file_uploader("Verbrauchs‑CSV (Pflicht)")
@@ -198,12 +204,12 @@ pv_files  = sb.file_uploader("PV‑CSV‑Dateien (optional, mehrere)", accept_mu
 
 sb.header("EV‑Ladefenster (Smart)")
 smart    = sb.checkbox("Smart‑Charging aktiv", True)
-cars_e   = sb.number_input("PKW‑Energie/Tag (kWh)", 0, 2000, 150)
-cars_p   = sb.number_input("PKW‑Leistung (kW)", 0, 350, 22)
+cars_e   = sb.number_input("PKW‑Energie/Tag (kWh)", min_value=0, max_value=2000, value=150)
+cars_p   = sb.number_input("PKW‑Leistung (kW)",     min_value=0, max_value=350,  value=22)
 cars_s   = sb.time_input("PKW‑Start", time(17))
-cars_e_t = sb.time_input("PKW‑Ende", time(6))
-trucks_e = sb.number_input("LKW‑Energie/Tag (kWh)", 0, 4000, 300)
-trucks_p = sb.number_input("LKW‑Leistung (kW)", 0, 1000, 60)
+cars_e_t = sb.time_input("PKW‑Ende",  time(6))
+trucks_e = sb.number_input("LKW‑Energie/Tag (kWh)", min_value=0, max_value=4000, value=300)
+trucks_p = sb.number_input("LKW‑Leistung (kW)",     min_value=0, max_value=1000, value=60)
 trucks_s = sb.time_input("LKW‑Start", time(20))
 trucks_e_t = sb.time_input("LKW‑Ende", time(4))
 
@@ -245,23 +251,26 @@ if run:
         mask_t = window_mask(load.index, trucks_s, trucks_e_t)
         prof["ev_trucks"] = smart_ev(net1, pv, trucks_e, trucks_p, mask_t)
 
-    net = build_network(prof, grid_kw)
-    add_capex(net, cap_kwh, cap_kw)
+    net = build_network(prof, grid_kw, cap_kwh, cap_kw, h_batt)
 
     with st.spinner("Optimierung läuft …"):
         net.optimize()
 
-    e_nom = net.storage_units.loc["battery", "e_nom_opt"]
+    # Ergebnisse: p_nom_opt direkt aus Netz; e_nom = p_nom_opt * h_batt
     p_nom = net.storage_units.loc["battery", "p_nom_opt"]
+    e_nom = p_nom * h_batt
+
     c1, c2 = st.columns(2)
     c1.metric("Energie (kWh)", f"{e_nom:.1f}")
     c2.metric("Leistung (kW)", f"{p_nom:.1f}")
 
     soc = net.storage_units_t["state_of_charge"].loc[:, "battery"]
+    # Approx. Grid-Import: Lasten + Generatoren + Änderung SOC (in kW)
+    dt_h = (soc.index[1] - soc.index[0]).total_seconds() / 3600
     grid_imp = (
         net.loads_t["p"].sum(axis=1)
         + net.generators_t["p"].sum(axis=1)
-        + soc.diff().fillna(0) / ((soc.index[1] - soc.index[0]).total_seconds() / 3600)
+        + soc.diff().fillna(0) / dt_h
     )
 
     st.subheader("Zeitreihen")
