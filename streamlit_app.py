@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.8
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.9
 ===================================================
 • Mehrere PV‑CSV‑Dateien werden addiert
 • Robuster CSV‑Reader (Semikolon/Komma, Dezimalpunkt/-komma)
@@ -10,6 +10,7 @@ streamlit_app.py · Battery‑Sizing Dashboard  v0.6.8
 • Matplotlib-Fallback + Versionsanzeige
 • CapEx: direkt an StorageUnit über capital_cost = cap_kw + cap_kwh * max_hours
   → Optimiert kW; Energie = p_nom_opt * max_hours
+• SOC-Ermittlung robust (Series/DataFrame) → kein KeyError auf "battery"
 """
 
 import io
@@ -264,8 +265,22 @@ if run:
     c1.metric("Energie (kWh)", f"{e_nom:.1f}")
     c2.metric("Leistung (kW)", f"{p_nom:.1f}")
 
-    soc = net.storage_units_t["state_of_charge"].loc[:, "battery"]
-    # Approx. Grid-Import: Lasten + Generatoren + Änderung SOC (in kW)
+    # --- SOC robust ermitteln (Series oder DataFrame) ---
+    soc_tbl = net.storage_units_t.get("state_of_charge")
+    if soc_tbl is None or len(soc_tbl) == 0:
+        st.error("Kein SOC in den Ergebnissen – Optimierung evtl. fehlgeschlagen.")
+        st.stop()
+
+    if isinstance(soc_tbl, pd.Series):
+        soc = soc_tbl.rename("battery")
+    else:
+        if "battery" in soc_tbl.columns:
+            soc = soc_tbl["battery"]
+        else:
+            first_col = soc_tbl.columns[0]
+            soc = soc_tbl[first_col].rename(first_col)
+
+    # Approx. Grid-Import: Lasten + Generatoren + d(SOC)/dt
     dt_h = (soc.index[1] - soc.index[0]).total_seconds() / 3600
     grid_imp = (
         net.loads_t["p"].sum(axis=1)
