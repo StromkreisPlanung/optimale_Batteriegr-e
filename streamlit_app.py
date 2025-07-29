@@ -1,16 +1,15 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.6.9
-===================================================
-• Mehrere PV‑CSV‑Dateien werden addiert
-• Robuster CSV‑Reader (Semikolon/Komma, Dezimalpunkt/-komma)
-• DST-Fix (Europe/Vienna), PyPSA bekommt tz‑naive Snapshots
+streamlit_app.py · Battery‑Sizing Dashboard  v0.6.11
+====================================================
+• Mehrere PV‑CSV (aufsummiert)
+• Robuster CSV‑Reader (Semikolon/Komma, Dezimalpunkt/-komma) + DST Fix
+• PyPSA bekommt tz‑naive Snapshots
 • Smart‑EV ohne reindex (duplikat‑sicher)
 • Page‑Config‑Guard
 • Matplotlib-Fallback + Versionsanzeige
-• CapEx: direkt an StorageUnit über capital_cost = cap_kw + cap_kwh * max_hours
-  → Optimiert kW; Energie = p_nom_opt * max_hours
-• SOC-Ermittlung robust (Series/DataFrame) → kein KeyError auf "battery"
+• CapEx direkt an StorageUnit (capital_cost = cap_kw + cap_kwh * max_hours)
+• SOC-Ermittlung robust (Series/DF/leer) – kein KeyError mehr
 """
 
 import io
@@ -22,19 +21,19 @@ import pandas as pd
 import pypsa
 import streamlit as st
 
-# --- Matplotlib optional laden (Fallback auf Streamlit-Charts) ---
+# ---- optional matplotlib (Fallback auf Streamlit-Charts) ----
 try:
     import matplotlib.pyplot as plt  # type: ignore
 except Exception:
     plt = None
 
-# --- Page Config (einmalig) ---
+# ---- Page Config (einmalig) ----
 try:
     st.set_page_config(page_title="Battery Sizing Tool", layout="wide")
 except st.errors.StreamlitAPIException:
     pass
 
-# --- Sidebar: Diagnose der Umgebung ---
+# ---- Sidebar: Umgebungsinfo ----
 def _mod_ver(name):
     spec = importlib.util.find_spec(name)
     if not spec:
@@ -257,37 +256,46 @@ if run:
     with st.spinner("Optimierung läuft …"):
         net.optimize()
 
-    # Ergebnisse: p_nom_opt direkt aus Netz; e_nom = p_nom_opt * h_batt
+    # Ergebnisse
     p_nom = net.storage_units.loc["battery", "p_nom_opt"]
     e_nom = p_nom * h_batt
+    if p_nom <= 1e-9:
+        st.info("Hinweis: Optimierung hat 0 kW Batterie gewählt (zu teuer/unnötig nach Kostenparametern).")
 
     c1, c2 = st.columns(2)
     c1.metric("Energie (kWh)", f"{e_nom:.1f}")
     c2.metric("Leistung (kW)", f"{p_nom:.1f}")
 
-    # --- SOC robust ermitteln (Series oder DataFrame) ---
+    # --- SOC robust ermitteln (Series/DF/leer) ---
     soc_tbl = net.storage_units_t.get("state_of_charge")
     if soc_tbl is None or len(soc_tbl) == 0:
-        st.error("Kein SOC in den Ergebnissen – Optimierung evtl. fehlgeschlagen.")
-        st.stop()
-
-    if isinstance(soc_tbl, pd.Series):
+        # komplett leer -> Null-SOC
+        soc = pd.Series(0.0, index=net.snapshots, name="battery")
+    elif isinstance(soc_tbl, pd.Series):
         soc = soc_tbl.rename("battery")
     else:
-        if "battery" in soc_tbl.columns:
+        # DataFrame-Fälle
+        cols = list(getattr(soc_tbl, "columns", []))
+        if "battery" in cols:
             soc = soc_tbl["battery"]
+        elif len(cols) >= 1:
+            soc = soc_tbl.iloc[:, 0].rename(str(cols[0]))
         else:
-            first_col = soc_tbl.columns[0]
-            soc = soc_tbl[first_col].rename(first_col)
+            # DF ohne Spalten -> Null-SOC
+            soc = pd.Series(0.0, index=net.snapshots, name="battery")
 
-    # Approx. Grid-Import: Lasten + Generatoren + d(SOC)/dt
-    dt_h = (soc.index[1] - soc.index[0]).total_seconds() / 3600
+    # Grid-Import (kW): Last + Generatoren + d(SOC)/dt
+    if len(soc.index) >= 2:
+        dt_h = (soc.index[1] - soc.index[0]).total_seconds() / 3600
+    else:
+        dt_h = 1.0
     grid_imp = (
         net.loads_t["p"].sum(axis=1)
         + net.generators_t["p"].sum(axis=1)
         + soc.diff().fillna(0) / dt_h
     )
 
+    # ---- Plots ----
     st.subheader("Zeitreihen")
     tabs = st.tabs(["Load", "PV", "EV Cars", "EV Trucks", "SOC + Grid"])
     plots = [load, -pv, prof["ev_cars"], prof["ev_trucks"]]
@@ -315,6 +323,7 @@ if run:
             ax.legend(loc="upper left"); ax2.legend(loc="upper right")
             st.pyplot(fig)
 
+    # ---- Download SOC ----
     st.subheader("SOC‑CSV herunterladen")
     buf = io.StringIO()
     soc.to_csv(buf)
