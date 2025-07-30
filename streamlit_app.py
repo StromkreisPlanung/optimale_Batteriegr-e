@@ -1,15 +1,16 @@
 from __future__ import annotations
 """
-streamlit_app.py · Battery‑Sizing Dashboard  v0.8.0
+streamlit_app.py · Battery‑Sizing Dashboard  v0.8.1
 ===================================================
+• CSV deutsch/englisch (Semikolon/Komma, Dezimalkomma/-punkt) + DST-Fix
 • Mehrere PV‑CSV (aufsummiert)
-• Robuster CSV‑Reader (Semikolon/Komma, Dezimalpunkt/-komma) + DST Fix
+• Smart‑EV (priorisiert PV‑Überschuss)
 • PyPSA mit tz‑naiven Snapshots + korrekter Zeitgewichtung (h)
-• Smart‑EV lädt bei PV‑Überschuss (residuale Last < 0)
-• PV als positive Erzeugung (Signatur korrigiert)
-• CapEx: capital_cost = cap_kw + cap_kwh * max_hours (€/kW_eff)
-• NEU: Strompreis (€/kWh) – dispatchbarer Netz‑Import mit marginal_cost
-• Kennzahlen: p_nom, e_nom, Netzbezug (kWh) & Energiekosten (EUR)
+• PV als positive Erzeugung
+• Batterie‑CapEx: capital_cost = cap_kW + cap_kWh * max_hours (€/kW_eff)
+• Netzimport mit kWh‑Preis (marginal_cost)
+• Residual‑Fix: Duplikate vor reindex entfernen
+• Optional: Sensitivität zu max_hours
 """
 
 import io
@@ -139,6 +140,14 @@ def smart_ev(load_kw: pd.Series, pv_kw: pd.Series, e_kwh: float, p_kw: float, ma
                     break
     return out
 
+# ---------- Sanitizer für Reindex/Plots (duplikat-sicher) ---------- #
+def _sanitize_for_snaps(s: pd.Series, snaps: pd.DatetimeIndex) -> pd.Series:
+    """Entfernt Duplikate per Mittelwert, sortiert, macht tz-naiv und reindext auf snaps."""
+    s = s.groupby(level=0).mean().sort_index()
+    if getattr(s.index, "tz", None) is not None:
+        s.index = s.index.tz_localize(None)
+    return s.reindex(snaps).fillna(0.0)
+
 # ------------------- PyPSA‑Netz (mit Preis) -------------- #
 def build_network(p: dict[str, pd.Series],
                   grid_kw: float,
@@ -147,13 +156,6 @@ def build_network(p: dict[str, pd.Series],
                   h_batt: float,
                   price_buy_eur_per_kwh: float) -> pypsa.Network:
     """Zeitreihen defensiv, Snapshots + Zeitgewichtung (h), Netz‑Import mit kWh‑Preis."""
-    def sanitize(s: pd.Series, snaps: pd.DatetimeIndex) -> pd.Series:
-        s = s.groupby(level=0).mean()
-        s = s.sort_index()
-        if getattr(s.index, "tz", None) is not None:
-            s.index = s.index.tz_localize(None)
-        return s.reindex(snaps).fillna(0.0)
-
     n = pypsa.Network()
     snaps = pd.Index(p["load"].index).drop_duplicates(keep="first").sort_values()
     n.set_snapshots(snaps)
@@ -163,7 +165,6 @@ def build_network(p: dict[str, pd.Series],
         dt_h = (snaps[1] - snaps[0]).total_seconds() / 3600.0
     else:
         dt_h = 1.0
-    # In PyPSA 0.35 reicht eine Series:
     n.snapshot_weightings = pd.Series(dt_h, index=snaps)
 
     n.add("Bus", "grid")
@@ -176,10 +177,11 @@ def build_network(p: dict[str, pd.Series],
     # PV als positive Erzeugung (kostenlos, fix)
     n.add("Generator", "pv", bus="grid", marginal_cost=0.0)
 
-    load_s   = sanitize(p["load"], snaps)
-    ev_cars  = sanitize(p["ev_cars"], snaps)
-    ev_truck = sanitize(p["ev_trucks"], snaps)
-    pv_s     = sanitize(p["pv"], snaps)
+    # Sanitized Zeitreihen exakt auf snaps
+    load_s   = _sanitize_for_snaps(p["load"], snaps)
+    ev_cars  = _sanitize_for_snaps(p["ev_cars"], snaps)
+    ev_truck = _sanitize_for_snaps(p["ev_trucks"], snaps)
+    pv_s     = _sanitize_for_snaps(p["pv"], snaps)
 
     n.loads_t.p_set = pd.DataFrame(
         index=snaps,
@@ -198,7 +200,7 @@ def build_network(p: dict[str, pd.Series],
         bus="grid",
         p_nom=grid_kw,            # Import‑Leistungsgrenze
         p_nom_extendable=False,
-        marginal_cost=price_buy_eur_per_kwh,  # €/kWh (da wir kW & h nutzen)
+        marginal_cost=price_buy_eur_per_kwh,  # €/kWh
         p_max_pu=1.0,
         p_min_pu=0.0,
     )
@@ -217,6 +219,41 @@ def build_network(p: dict[str, pd.Series],
         marginal_cost=0.0,
     )
     return n
+
+# --------------- Sensitivität: Hilfsfunktion --------------- #
+def run_sensitivity(prof: dict,
+                    grid_kw: float,
+                    cap_kwh: float,
+                    cap_kw: float,
+                    price_buy: float,
+                    hours_list: list[float]) -> pd.DataFrame:
+    rows = []
+    prog = st.progress(0.0)
+    total = max(1, len(hours_list))
+    for i, h in enumerate(hours_list, start=1):
+        p = float("nan")
+        try:
+            n = build_network(prof, grid_kw, cap_kwh, cap_kw, h, price_buy)
+            n.optimize()
+            p = float(n.storage_units.loc["battery", "p_nom_opt"])
+        except Exception:
+            p = float("nan")
+
+        e = p * h if pd.notna(p) else float("nan")
+        cap_eff = cap_kw + cap_kwh * h
+        invest = cap_eff * p if pd.notna(p) else float("nan")
+
+        rows.append({
+            "max_hours_h": h,
+            "p_nom_kw": p,
+            "e_nom_kwh": e,
+            "capital_cost_eur_per_kw_eff": cap_eff,
+            "invest_estimate_eur": invest,
+        })
+        prog.progress(min(1.0, i / total))
+
+    df = pd.DataFrame(rows).sort_values("max_hours_h").set_index("max_hours_h")
+    return df
 
 # ----------------------- UI ------------------------------- #
 st.title("🔋 Optimale Batteriegröße bestimmen")
@@ -297,7 +334,7 @@ if run:
 
     # Netz‑Import‑Energie und Kosten
     gi = net.generators_t["p"].get("grid_import")
-    if gi is not None is not ...:
+    if gi is not None:
         # kW * h = kWh (Zeitgewichtung ist bereits gesetzt)
         if len(net.snapshots) >= 2:
             dt_h = (net.snapshots[1] - net.snapshots[0]).total_seconds() / 3600.0
@@ -324,16 +361,8 @@ if run:
         else:
             soc = pd.Series(0.0, index=net.snapshots, name="battery")
 
-    # Residuale Last und Netz‑Import für Plot
-    residual = (prof["load"] + prof["ev_cars"] + prof["ev_trucks"] - prof["pv"]).reindex(net.snapshots).fillna(0.0)
-    grid_imp_series = net.generators_t["p"].get("grid_import")
-    if grid_imp_series is None:
-        # Fallback‑Approximation
-        if len(soc.index) >= 2:
-            dt_h = (soc.index[1] - soc.index[0]).total_seconds() / 3600
-        else:
-            dt_h = 1.0
-        grid_imp_series = residual + soc.diff().fillna(0) / dt_h
+    # Residual (Last + EV – PV) duplikat-sicher und auf snaps reindext
+    residual = _sanitize_for_snaps(prof["load"] + prof["ev_cars"] + prof["ev_trucks"] - prof["pv"], net.snapshots)
 
     # ---- Plots ----
     st.subheader("Zeitreihen")
@@ -343,14 +372,15 @@ if run:
     for tab, data, ylabel in zip(tabs[:4], plots, ["kW","kW","kW","kW"]):
         with tab:
             if plt is None:
-                st.line_chart(data.rename(ylabel))
+                st.line_chart(_sanitize_for_snaps(data, net.snapshots).rename(ylabel))
             else:
                 fig, ax = plt.subplots()
-                data.plot(ax=ax)
+                _sanitize_for_snaps(data, net.snapshots).plot(ax=ax)
                 ax.set_ylabel(ylabel)
                 st.pyplot(fig)
 
     with tabs[4]:
+        grid_imp_series = gi if gi is not None else pd.Series(0.0, index=net.snapshots)
         if plt is None:
             st.line_chart(soc.rename("SOC (kWh)"))
             st.line_chart(grid_imp_series.rename("Grid (kW)"))
@@ -378,3 +408,58 @@ if run:
     buf = io.StringIO()
     soc.to_csv(buf)
     st.download_button("Download CSV", buf.getvalue(), file_name="battery_soc.csv")
+
+    # --------------- Sensitivitätsanalyse: UI --------------- #
+    st.divider()
+    st.subheader("Sensitivität zu max_hours")
+
+    sens_on = st.checkbox("Sensitivitätsanalyse aktivieren (mehrere Batteriedauern testen)", value=False)
+
+    if sens_on:
+        colA, colB, colC = st.columns(3)
+        with colA:
+            h_min = st.number_input("min (h)", min_value=0.25, max_value=12.0, value=1.0, step=0.25)
+        with colB:
+            h_max = st.number_input("max (h)", min_value=0.25, max_value=12.0, value=4.0, step=0.25)
+        with colC:
+            h_step = st.number_input("Schritt (h)", min_value=0.25, max_value=4.0, value=0.5, step=0.25)
+
+        # Liste der Stufen erzeugen (z. B. 1.0, 1.5, 2.0, ...)
+        hours_list = []
+        h = h_min
+        while h <= h_max + 1e-9:
+            hours_list.append(round(h, 2))
+            h += h_step
+
+        if st.button("⏱️ Sensitivität rechnen"):
+            with st.spinner("Berechne Sensitivität…"):
+                df_sens = run_sensitivity(prof, grid_kw, cap_kwh, cap_kw, price_buy, hours_list)
+
+            st.write("**Ergebnisse (je Dauer):**")
+            st.dataframe(
+                df_sens.style.format({
+                    "p_nom_kw": "{:.1f}",
+                    "e_nom_kwh": "{:.1f}",
+                    "capital_cost_eur_per_kw_eff": "{:.0f}",
+                    "invest_estimate_eur": "{:,.0f}",
+                }),
+                use_container_width=True
+            )
+
+            # Kurven zeichnen
+            if plt is None:
+                st.line_chart(df_sens[["p_nom_kw"]].rename(columns={"p_nom_kw": "p_nom (kW)"}))
+                st.line_chart(df_sens[["e_nom_kwh"]].rename(columns={"e_nom_kwh": "e_nom (kWh)"}))
+                st.line_chart(df_sens[["invest_estimate_eur"]].rename(columns={"invest_estimate_eur": "Invest (EUR)"}))
+            else:
+                for col, ylabel, title in [
+                    ("p_nom_kw", "kW", "Optimale Leistung vs. max_hours"),
+                    ("e_nom_kwh", "kWh", "Optimale Energie vs. max_hours"),
+                    ("invest_estimate_eur", "EUR", "Invest‑Schätzung vs. max_hours"),
+                ]:
+                    fig, ax = plt.subplots()
+                    df_sens[col].plot(ax=ax, marker="o")
+                    ax.set_xlabel("max_hours (h)")
+                    ax.set_ylabel(ylabel)
+                    ax.set_title(title)
+                    st.pyplot(fig)
